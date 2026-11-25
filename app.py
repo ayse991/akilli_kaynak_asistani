@@ -1,3 +1,5 @@
+cd /Users/aysedemirelli/Desktop/akilli-kaynak-asistani
+cat << 'EOF' > app.py
 import json
 import re
 from collections import Counter
@@ -18,19 +20,20 @@ STOP_WORDS = {
     "ama", "ancak", "lakin", "fakat", "göre", "birlikte", "olarak",
     "daha", "çok", "ise", "mi", "mı", "mu", "mü", "the", "and", "of",
     "to", "in", "is", "for", "with", "on", "that", "as", "are", "from",
-    "birçok", "bazı", "her", "tüm", "veya", "ya da", "çünkü", "ancak",
+    "birçok", "bazı", "her", "tüm", "veya", "ya da", "çünkü", "sonra",
+    "önce", "kendi", "bunu", "şunu", "ona", "buna", "şuna", "olarak",
 }
 
 POS_WORDS = {
     "başarılı", "hızlı", "verimli", "gelişmiş", "avantaj", "faydalı",
     "güvenli", "kolay", "etkili", "olumlu", "büyüme", "inovasyon",
-    "çözüm", "iyileştirme", "doğru", "güçlü", "artış",
+    "çözüm", "iyileştirme", "doğru", "güçlü", "artış", "destek",
 }
 
 NEG_WORDS = {
     "sorun", "risk", "hata", "eksik", "yavaş", "kısıt", "zorluk",
     "olumsuz", "kayıp", "maliyet", "engelleme", "zayıf", "tehlike",
-    "karmaşık", "gecikme", "bağımlılık",
+    "karmaşık", "gecikme", "bağımlılık", "engel", "başarısız",
 }
 
 DEFAULT_SOURCE_TEXT = (
@@ -55,6 +58,15 @@ SAMPLE_COMPARE_TEXT = (
     "hız ve yapı ayrıştırma açısından kendi avantaj ve kısıtlarına sahiptir."
 )
 
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
 
 def tr_lower(text: str) -> str:
     return text.replace("İ", "i").replace("I", "ı").lower()
@@ -76,12 +88,23 @@ def extract_ngrams(tokens: list[str], n: int = 2, limit: int = 8) -> list[tuple[
 
 
 def split_sentences(text: str) -> list[str]:
-    parts = re.split(r"[.!?]+", text.strip())
-    return [re.sub(r"\s+", " ", p).strip() for p in parts if len(p.strip()) > 15]
+    # Nokta, ünlem, soru işareti veya satır sonlarına göre cümlelere ayır
+    raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    sentences = []
+    for line in raw_lines:
+        parts = re.split(r"(?<=[.!?])\s+", line)
+        for p in parts:
+            cleaned = re.sub(r"\s+", " ", p).strip()
+            if len(cleaned) >= 12:
+                sentences.append(cleaned)
+    return sentences
 
 
 def fetch_web_content(url: str, scrape_method: str) -> dict:
     clean_url = url.strip()
+    if not clean_url.startswith(("http://", "https://")):
+        clean_url = "https://" + clean_url
+
     html_text = None
     note = None
     used_method = scrape_method
@@ -97,7 +120,7 @@ def fetch_web_content(url: str, scrape_method: str) -> dict:
             opts.add_argument("--disable-dev-shm-usage")
             driver = webdriver.Chrome(options=opts)
             try:
-                driver.set_page_load_timeout(12)
+                driver.set_page_load_timeout(15)
                 driver.get(clean_url)
                 html_text = driver.page_source
             finally:
@@ -108,47 +131,75 @@ def fetch_web_content(url: str, scrape_method: str) -> dict:
 
     if html_text is None:
         try:
-            res = requests.get(clean_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            res = requests.get(clean_url, headers=BROWSER_HEADERS, timeout=12)
+            res.encoding = res.apparent_encoding or "utf-8"
             res.raise_for_status()
             html_text = res.text
         except Exception as exc:
-            msg = f"{note + ' | ' if note else ''}Bağlantı kurulamadı ({exc}); örnek metin yüklendi."
             return {
-                "title": "Örnek Kaynak",
-                "text": DEFAULT_SOURCE_TEXT,
-                "method": "Fallback (Yerel)",
-                "note": msg,
+                "title": "Erişim Hatası",
+                "text": st.session_state.get("working_text", DEFAULT_SOURCE_TEXT),
+                "method": "Bağlantı Engellendi",
+                "note": f"URL çekilemedi ({exc}). Site bot koruması kullanıyor olabilir; sayfadaki metni kopyalayıp aşağıdaki kutuya yapıştırabilirsin.",
+                "error": True,
                 "headings_count": 0,
-                "paragraphs_count": 1,
+                "paragraphs_count": 0,
             }
 
     soup = BeautifulSoup(html_text, "html.parser")
-    for tag in soup(["script", "style", "noscript", "nav", "footer", "aside"]):
+    for tag in soup(["script", "style", "noscript", "nav", "footer", "aside", "header", "form"]):
         tag.decompose()
 
-    title = soup.title.string.strip() if soup.title and soup.title.string else "Başlıksız Kaynak"
-    all_headings = [h.get_text(" ", strip=True) for h in soup.find_all(["h1", "h2", "h3"]) if h.get_text(" ", strip=True)]
-    all_paras = [p.get_text(" ", strip=True) for p in soup.find_all("p") if len(p.get_text(" ", strip=True)) > 25]
+    title = soup.title.string.strip() if soup.title and soup.title.string else clean_url
+    container = soup.find("article") or soup.find("main") or soup.body or soup
+
+    all_headings = [
+        h.get_text(" ", strip=True)
+        for h in container.find_all(["h1", "h2", "h3"])
+        if len(h.get_text(" ", strip=True)) > 3
+    ]
+    all_paras = [
+        p.get_text(" ", strip=True)
+        for p in container.find_all("p")
+        if len(p.get_text(" ", strip=True)) > 25
+    ]
 
     if scrape_method == "BeautifulSoup (Başlık + Yapı Odaklı)":
         blocks = [
             f"[{el.name.upper()}] {el.get_text(' ', strip=True)}"
             if el.name in {"h1", "h2", "h3"}
             else el.get_text(" ", strip=True)
-            for el in soup.find_all(["h1", "h2", "h3", "p"])
+            for el in container.find_all(["h1", "h2", "h3", "p", "li"])
             if len(el.get_text(" ", strip=True)) > 20
         ]
     else:
         blocks = all_paras
 
-    joined = "\n".join(blocks[:40]).strip()
-    if not joined:
-        msg = f"{note + ' | ' if note else ''}Sayfada okunabilir metin bulunamadı; örnek metin yüklendi."
+    # Eğer <p> etiketleri boşsa div/article içindeki düz paragraf bloklarını yakala
+    if not blocks:
+        fallback_lines = [
+            line.strip()
+            for line in container.get_text("\n").splitlines()
+            if len(line.strip()) > 35
+        ]
+        blocks = fallback_lines[:40]
+
+    # Tekrar eden satırları temizle
+    seen = set()
+    unique_blocks = []
+    for b in blocks:
+        if b not in seen:
+            seen.add(b)
+            unique_blocks.append(b)
+
+    joined = "\n\n".join(unique_blocks[:45]).strip()
+    if len(joined) < 40:
         return {
             "title": title,
-            "text": DEFAULT_SOURCE_TEXT,
-            "method": "Fallback (Yerel)",
-            "note": msg,
+            "text": st.session_state.get("working_text", DEFAULT_SOURCE_TEXT),
+            "method": used_method,
+            "note": "Bu sayfa içeriğini JavaScript ile sonradan yüklüyor olabilir (boş metin döndü). Metni kopyalayıp aşağıdaki kutuya yapıştırarak analiz edebilirsin.",
+            "error": True,
             "headings_count": len(all_headings),
             "paragraphs_count": len(all_paras),
         }
@@ -157,7 +208,8 @@ def fetch_web_content(url: str, scrape_method: str) -> dict:
         "title": title,
         "text": joined,
         "method": used_method,
-        "note": note,
+        "note": note or f"'{title}' başarıyla çekildi ({len(joined)} karakter).",
+        "error": False,
         "headings_count": len(all_headings),
         "paragraphs_count": len(all_paras),
     }
@@ -169,34 +221,33 @@ def score_sentences(text: str) -> list[dict]:
     scored = []
     for idx, sent in enumerate(sents):
         s_tokens = extract_tokens(sent, filter_stopwords=True)
-        base_score = sum(freq.get(tok, 0) for tok in s_tokens)
-        lead_bonus = 2 if idx == 0 else 0
-        total = round(base_score + lead_bonus, 1)
+        if not s_tokens:
+            continue
+        # Uzun cümlelerin haksız puan şişirmesini önlemek için normalize skor
+        base_score = sum(freq.get(tok, 0) for tok in s_tokens) / (len(s_tokens) ** 0.4)
+        lead_bonus = 1.5 if idx == 0 else 0.0
+        total = round(base_score + lead_bonus, 2)
         scored.append({"index": idx + 1, "score": total, "sentence": sent})
     return scored
 
 
 def summarize_text(text: str, sentence_count: int = 2) -> str:
-    scored = score_sentences(text)
+    clean = text.strip()
+    if not clean:
+        return "Özetlenecek metin bulunamadı."
+    scored = score_sentences(clean)
     if not scored:
-        return text[:300]
+        return clean[:350] + ("..." if len(clean) > 350 else "")
     top_sents = sorted(scored, key=lambda x: (-x["score"], x["index"]))[:sentence_count]
     return " ".join(item["sentence"] for item in sorted(top_sents, key=lambda x: x["index"]))
 
 
 def extract_key_bullets(text: str) -> list[str]:
-    sents = split_sentences(text)
-    bullets = []
-    for sent in sents:
-        has_number = bool(re.search(r"\d+", sent))
-        has_signal = any(k in tr_lower(sent) for k in ("sağlar", "önemli", "ancak", "yöntem", "amaç", "sonuç", "zorluk"))
-        if has_number or has_signal:
-            bullets.append(sent)
-        if len(bullets) == 4:
-            break
-    if not bullets and sents:
-        bullets = sents[:3]
-    return bullets
+    scored = score_sentences(text)
+    if not scored:
+        return [text[:200]] if text.strip() else []
+    ranked = sorted(scored, key=lambda x: (-x["score"], x["index"]))[:4]
+    return [item["sentence"] for item in sorted(ranked, key=lambda x: x["index"])]
 
 
 def detect_tone_details(tokens: list[str]) -> tuple[str, list[str], list[str]]:
@@ -258,7 +309,7 @@ def optional_llm_refine(prompt_text: str, api_key: str) -> str | None:
 
 def answer_query(query: str, text: str, api_key: str = "") -> tuple[str, str]:
     llm_reply = optional_llm_refine(
-        f"Şu metne dayanarak soruyu yanıtla:\nMetin:\n{text[:2000]}\n\nSoru: {query}",
+        f"Şu metne dayanarak soruyu yanıtla:\nMetin:\n{text[:2500]}\n\nSoru: {query}",
         api_key,
     )
     if llm_reply:
@@ -337,9 +388,12 @@ if "assistant_data" not in st.session_state:
         "text": DEFAULT_SOURCE_TEXT,
         "method": "Örnek Metin",
         "note": None,
+        "error": False,
         "headings_count": 0,
         "paragraphs_count": 1,
     }
+if "working_text" not in st.session_state:
+    st.session_state["working_text"] = DEFAULT_SOURCE_TEXT
 if "history" not in st.session_state:
     st.session_state["history"] = []
 if "qa_history" not in st.session_state:
@@ -358,7 +412,7 @@ with st.sidebar:
         ],
     )
     apply_stopwords = st.checkbox("Stop-words temizliği uygula", value=True)
-    summary_len = st.slider("Özet cümle sayısı", 1, 4, 2)
+    summary_len = st.slider("Özet cümle sayısı", 1, 5, 2)
     top_n = st.slider("Anahtar kelime adedi", 5, 15, 8)
 
     st.markdown("---")
@@ -369,18 +423,25 @@ with st.sidebar:
             "text": DEFAULT_SOURCE_TEXT,
             "method": "Hazır Örnek",
             "note": "Teknik kaynak örnek metni yüklendi.",
+            "error": False,
             "headings_count": 1,
             "paragraphs_count": 2,
         }
+        st.session_state["working_text"] = DEFAULT_SOURCE_TEXT
+        st.rerun()
+
     if st.button("Duyuru / Süreç Örneği", use_container_width=True):
         st.session_state["assistant_data"] = {
             "title": "Duyuru & Kriter Senaryosu",
             "text": SAMPLE_ANNOUNCEMENT_TEXT,
             "method": "Hazır Örnek",
             "note": "Duyuru ve kriter örnek metni yüklendi.",
+            "error": False,
             "headings_count": 1,
             "paragraphs_count": 1,
         }
+        st.session_state["working_text"] = SAMPLE_ANNOUNCEMENT_TEXT
+        st.rerun()
 
     with st.expander("İsteğe Bağlı Harici LLM API"):
         api_key_input = st.text_input("OpenAI API Key (Opsiyonel)", type="password")
@@ -392,10 +453,16 @@ with st.sidebar:
         for idx, item in enumerate(reversed(st.session_state["history"][-5:])):
             if st.button(f"📄 {item['title'][:24]}", key=f"hist_{idx}"):
                 st.session_state["assistant_data"] = item
+                st.session_state["working_text"] = item["text"]
+                st.rerun()
 
 url_col, btn_col1, btn_col2 = st.columns([3.5, 1.2, 1.3])
 with url_col:
-    url_val = st.text_input("Web Sayfası Bağlantısı (URL)", value="https://tr.wikipedia.org/wiki/Yapay_zek%C3%A2")
+    url_val = st.text_input(
+        "Web Sayfası Bağlantısı (URL)",
+        value="https://tr.wikipedia.org/wiki/Yapay_zek%C3%A2",
+        placeholder="https://...",
+    )
 with btn_col1:
     st.write("")
     st.write("")
@@ -406,23 +473,28 @@ with btn_col2:
     ab_clicked = st.button("A/B Yöntem Kıyasla", use_container_width=True)
 
 if fetch_clicked and url_val.strip():
-    fetched_dict = fetch_web_content(url_val, scrape_method)
+    with st.spinner("Web sayfasından içerik çekiliyor..."):
+        fetched_dict = fetch_web_content(url_val, scrape_method)
     st.session_state["assistant_data"] = fetched_dict
-    st.session_state["history"].append(fetched_dict)
+    if not fetched_dict.get("error"):
+        st.session_state["working_text"] = fetched_dict["text"]
+        st.session_state["history"].append(fetched_dict)
+    st.rerun()
 
 if ab_clicked and url_val.strip():
-    res_p = fetch_web_content(url_val, "BeautifulSoup (Paragraf Odaklı)")
-    res_h = fetch_web_content(url_val, "BeautifulSoup (Başlık + Yapı Odaklı)")
+    with st.spinner("İki kazıma yöntemi karşılaştırılıyor..."):
+        res_p = fetch_web_content(url_val, "BeautifulSoup (Paragraf Odaklı)")
+        res_h = fetch_web_content(url_val, "BeautifulSoup (Başlık + Yapı Odaklı)")
     st.session_state["ab_comparison"] = {"para": res_p, "head": res_h}
 
 current = st.session_state["assistant_data"]
-src_title = current["title"]
-src_text = current["text"]
-active_method = current["method"]
 status_msg = current.get("note")
 
 if status_msg:
-    st.info(status_msg)
+    if current.get("error"):
+        st.warning(status_msg)
+    else:
+        st.success(status_msg)
 
 if st.session_state["ab_comparison"]:
     ab_p = st.session_state["ab_comparison"]["para"]
@@ -438,14 +510,32 @@ if st.session_state["ab_comparison"]:
             st.caption(f"Karakter: {len(ab_h['text'])} | Token: {len(extract_tokens(ab_h['text'], apply_stopwords))}")
             st.write(summarize_text(ab_h["text"], sentence_count=2))
 
-editable_text = st.text_area(
-    "Çalışma Metni (İstersen doğrudan düzenleyebilir veya yeni metin yapıştırabilirsin)",
-    value=src_text,
-    height=175,
-)
+with st.form("text_analysis_form", clear_on_submit=False):
+    text_box_val = st.text_area(
+        "Çalışma Metni (Paragrafını buraya yapıştırıp aşağıdaki 'Metni Analiz Et & Özetle' butonuna bas)",
+        value=st.session_state["working_text"],
+        height=190,
+    )
+    f_col1, f_col2 = st.columns([1.4, 3.6])
+    with f_col1:
+        analyze_submitted = st.form_submit_button("✨ Metni Analiz Et & Özetle", type="primary", use_container_width=True)
+    with f_col2:
+        st.caption("İpucu: URL çekemediğin korumalı sayfalardaki metni buraya yapıştırıp doğrudan özetleyebilirsin.")
 
-raw_words = extract_tokens(editable_text, filter_stopwords=False)
-tokens = extract_tokens(editable_text, filter_stopwords=apply_stopwords)
+if analyze_submitted:
+    st.session_state["working_text"] = text_box_val
+    st.session_state["assistant_data"]["title"] = "Manuel Yapıştırılan Metin"
+    st.session_state["assistant_data"]["method"] = "Doğrudan Metin Girişi"
+    st.session_state["assistant_data"]["note"] = "Yapıştırdığın metin analiz edildi ve özet güncellendi."
+    st.session_state["assistant_data"]["error"] = False
+    st.rerun()
+
+active_text = st.session_state["working_text"]
+src_title = current["title"]
+active_method = current["method"]
+
+raw_words = extract_tokens(active_text, filter_stopwords=False)
+tokens = extract_tokens(active_text, filter_stopwords=apply_stopwords)
 freq = Counter(tokens)
 bigrams = extract_ngrams(tokens, n=2, limit=8)
 trigrams = extract_ngrams(tokens, n=3, limit=6)
@@ -460,22 +550,23 @@ m3.metric("İşlenen Token", len(tokens))
 m4.metric("Kelime Çeşitliliği", f"%{vocab_richness}")
 m5.metric("Genel Ton", tone_label)
 
+summary_output = summarize_text(active_text, sentence_count=summary_len)
+top_words = freq.most_common(top_n)
+
+# Özeti sekmelerin de üstünde hemen görünür kılalım
+st.subheader("📌 Anlık Otomatik Özet")
+st.info(summary_output)
+
 tab_ozet, tab_analiz, tab_soru, tab_arka_plan = st.tabs([
-    "📌 Özet & Kritik Maddeler",
+    "🎯 Kritik Maddeler & Ton",
     "📊 Kavram, N-Gram & Benzerlik",
     "💬 Akıllı Soru-Cevap",
     "🛠️ Arka Plan NLP & Kazıma",
 ])
 
-summary_output = summarize_text(editable_text, sentence_count=summary_len)
-top_words = freq.most_common(top_n)
-
 with tab_ozet:
-    st.subheader("Otomatik Özet")
-    st.success(summary_output)
-
     st.subheader("Öne Çıkan Kritik Noktalar")
-    for bullet in extract_key_bullets(editable_text):
+    for bullet in extract_key_bullets(active_text):
         st.markdown(f"- {bullet}")
 
     st.caption(
@@ -523,7 +614,7 @@ with tab_analiz:
     st.subheader("Metin İçi Kavram / Kelime Arama")
     search_term = st.text_input("Metin içinde ara:", placeholder="Örn: veri, model, analiz...")
     if search_term.strip():
-        matches = search_in_text(search_term, editable_text)
+        matches = search_in_text(search_term, active_text)
         if matches:
             st.dataframe(matches, use_container_width=True, hide_index=True)
         else:
@@ -533,7 +624,7 @@ with tab_analiz:
     st.subheader("İkinci Kaynak / Metin ile Benzerlik Analizi")
     compare_input = st.text_area("Karşılaştırılacak İkinci Metin:", value=SAMPLE_COMPARE_TEXT, height=110)
     if compare_input.strip():
-        cmp_res = compare_two_texts(editable_text, compare_input, filter_sw=apply_stopwords)
+        cmp_res = compare_two_texts(active_text, compare_input, filter_sw=apply_stopwords)
         st.metric("Jaccard Kelime Benzerliği", f"%{cmp_res['jaccard']}")
         st.write("**Ortak Kavramlar:**", ", ".join(cmp_res["common"]) if cmp_res["common"] else "Ortak terim yok.")
         st.write("**Yalnızca Mevcut Metinde:**", ", ".join(cmp_res["only_a"]) if cmp_res["only_a"] else "Yok.")
@@ -558,7 +649,7 @@ with tab_soru:
         placeholder="Örn: Veri toplama adımlarında nelere dikkat edilmeli?",
     )
     if user_question.strip():
-        ans, engine_used = answer_query(user_question, editable_text, api_key_input)
+        ans, engine_used = answer_query(user_question, active_text, api_key_input)
         st.info(ans)
         st.caption(f"Yanıt motoru: {engine_used}")
         if not st.session_state["qa_history"] or st.session_state["qa_history"][-1][0] != user_question.strip():
@@ -573,13 +664,13 @@ with tab_arka_plan:
     st.subheader("Arka Plan NLP Ön İşleme & Cümle Skorları")
     st.write(
         f"**Aktif Kazıma Modu:** `{active_method}` | "
-        f"**Karakter:** `{len(editable_text)}` | "
+        f"**Karakter:** `{len(active_text)}` | "
         f"**Ham Kelime:** `{len(raw_words)}` | "
         f"**Filtrelenmiş Token:** `{len(tokens)}`"
     )
     st.write(", ".join(f"`{t}`" for t in tokens[:60]) if tokens else "Token bulunamadı.")
 
-    scored_rows = score_sentences(editable_text)
+    scored_rows = score_sentences(active_text)
     if scored_rows:
         st.markdown("**Cümle Önem Puanları (Özet Seçim Kriteri):**")
         st.dataframe(scored_rows[:10], use_container_width=True, hide_index=True)
@@ -629,3 +720,4 @@ with tab_arka_plan:
             mime="application/json",
             use_container_width=True,
         )
+EOF
