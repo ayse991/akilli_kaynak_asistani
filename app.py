@@ -1,5 +1,5 @@
 
-cat << 'EOF' > app.py
+
 import json
 import re
 from collections import Counter
