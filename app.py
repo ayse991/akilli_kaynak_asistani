@@ -720,4 +720,4 @@ with tab_arka_plan:
             mime="application/json",
             use_container_width=True,
         )
-EOF
+
