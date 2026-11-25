@@ -1,4 +1,4 @@
-cd /Users/aysedemirelli/Desktop/akilli-kaynak-asistani
+
 cat << 'EOF' > app.py
 import json
 import re
